@@ -2,32 +2,33 @@
  * Copyright (c) 2026 MAC Attack (Alex Salamati, James Manikyan, Marco Flores)
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tiny Tapeout wrapper for tiny_tpu_pe (one INT4 MAC processing element).
- * The host (the RP2040 on the Tiny Tapeout demo board) keeps the model and sends one
- * command at a time with a 4-phase handshake, so it works at any host speed:
+ * Tiny-TPU v2 for Tiny Tapeout: tiny_tpu_pe8 (INT8 MAC, 22-bit sum, 32-byte input buffer) on the
+ * demo board's pins. The host (the board's RP2040) keeps the model and runs it layer by layer:
  *
- *   1. put the operands on ui_in and the command on uio_in[1:0]
- *   2. raise STROBE (uio_in[2])
- *   3. wait for ACK (uio_out[4]) = 1      the command has been executed
- *   4. lower STROBE, wait for ACK = 0     ready for the next command
+ *   per layer:   CLEAR, LOAD_X x (number of inputs)          the inputs go in once
+ *   per neuron:  CLEAR, MAC x (number of inputs), READ       one weight byte per MAC
+ *                then read the 22-bit sum (3 bytes) and do bias / requantize / ReLU on the host
  *
  * Pins
- *   ui_in[3:0]   a, activation (signed INT4)
- *   ui_in[7:4]   w, weight     (signed INT4)
- *   uio_in[1:0]  command: 0 NOP, 1 CLEAR, 2 MAC, 3 READ
- *   uio_in[2]    STROBE (host -> chip)
- *   uio_in[3]    HI: 0 = uo_out shows result[7:0], 1 = result[15:8]
- *   uio_out[4]   ACK (chip -> host)
- *   uio_out[5]   OVF: sticky 16-bit overflow flag, cleared by CLEAR
- *   uo_out[7:0]  the selected byte of the 16-bit result latched by the last READ
+ *   ui_in[7:0]   DATA: an input value (LOAD_X) or a weight (MAC), signed 8-bit
+ *   uio_in[2:0]  CMD: 0 NOP, 1 CLEAR, 2 LOAD_X, 3 MAC, 4 READ
+ *   uio_in[3]    STROBE (MODE 0) or VALID (MODE 1)
+ *   uio_in[4]    MODE: 0 = handshake, works at any host speed; 1 = streaming, one command per clock
+ *   uio_in[6:5]  BSEL: which byte uo_out shows: 0 sum[7:0], 1 sum[15:8], 2 sum[21:16] sign-extended,
+ *                3 status {0, buffer position[5:0], OVF}
+ *   uio_out[7]   ACK (MODE 0)
+ *   uo_out[7:0]  the selected byte of the sum latched by the last READ (or the status byte)
  *
- * Operands and the command must be stable from step 1 until ACK = 1. STROBE goes through a
- * two-flip-flop synchronizer, so a command executes 2-3 clocks after STROBE rises.
+ * MODE 0 (handshake): set DATA and CMD, raise STROBE, wait for ACK = 1, lower STROBE, wait for
+ *   ACK = 0. STROBE goes through a two-flip-flop synchronizer, so the host can be on any clock.
+ * MODE 1 (streaming): every rising clock edge with VALID = 1 runs CMD on DATA, so a whole neuron is
+ *   one byte per clock. DATA, CMD and VALID must be synchronous to clk (for example, the RP2040
+ *   generating the clock and the data together). Change MODE only while idle.
  */
 
 `default_nettype none
 
-module tt_um_titaniumthunder_tiny_tpu (
+module tt_um_titaniumthunder_tiny_tpu8 (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
     input  wire [7:0] uio_in,   // IOs: Input path
@@ -38,50 +39,58 @@ module tt_um_titaniumthunder_tiny_tpu (
     input  wire       rst_n     // reset_n - low to reset
 );
 
-  wire rst = ~rst_n;
+  wire rst  = ~rst_n;
+  wire mode = uio_in[4];
 
-  // STROBE synchronizer and rising-edge detect
-  reg strobe_s1, strobe_s2, strobe_s3;
+  // MODE 0: STROBE synchronizer, rising-edge detect, and ACK
+  reg s1, s2, s3, ack;
   always @(posedge clk) begin
     if (rst) begin
-      strobe_s1 <= 1'b0;
-      strobe_s2 <= 1'b0;
-      strobe_s3 <= 1'b0;
+      s1  <= 1'b0;
+      s2  <= 1'b0;
+      s3  <= 1'b0;
+      ack <= 1'b0;
     end else begin
-      strobe_s1 <= uio_in[2];
-      strobe_s2 <= strobe_s1;
-      strobe_s3 <= strobe_s2;
+      s1  <= uio_in[3];
+      s2  <= s1;
+      s3  <= s2;
+      ack <= s2;                // rises on the clock edge that runs the command
     end
   end
-  wire cmd_valid = strobe_s2 & ~strobe_s3;
 
-  // ACK rises on the same clock edge that executes the command, and falls after STROBE falls
-  reg ack;
-  always @(posedge clk) begin
-    if (rst) ack <= 1'b0;
-    else     ack <= strobe_s2;
-  end
+  wire valid = mode ? uio_in[3] : (s2 & ~s3);
 
-  wire signed [15:0] result;
+  wire signed [21:0] result;
   wire               ovf;
+  wire        [5:0]  ptr;
 
-  tiny_tpu_pe u_pe (
-      .clk      (clk),
-      .rst      (rst),
-      .cmd_valid(cmd_valid),
-      .cmd      (uio_in[1:0]),
-      .a        (ui_in[3:0]),
-      .w        (ui_in[7:4]),
-      .result   (result),
-      .ovf      (ovf)
+  tiny_tpu_pe8 #(.N(32), .ACC(22)) u_pe (
+      .clk    (clk),
+      .rst    (rst),
+      .valid  (valid),
+      .cmd    (uio_in[2:0]),
+      .din    (ui_in),
+      .result (result),
+      .ovf    (ovf),
+      .ptr_out(ptr)
   );
 
-  assign uo_out  = uio_in[3] ? result[15:8] : result[7:0];
-  assign uio_out = {2'b00, ovf, ack, 4'b0000};
-  assign uio_oe  = 8'b0011_0000;                 // uio[5:4] are outputs, the rest inputs
+  reg [7:0] byte_out;
+  always @(*) begin
+    case (uio_in[6:5])
+      2'd0:    byte_out = result[7:0];
+      2'd1:    byte_out = result[15:8];
+      2'd2:    byte_out = {{2{result[21]}}, result[21:16]};
+      default: byte_out = {1'b0, ptr, ovf};
+    endcase
+  end
+
+  assign uo_out  = byte_out;
+  assign uio_out = {ack, 7'b0000000};
+  assign uio_oe  = 8'b1000_0000;               // uio[7] is an output, the rest inputs
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in[7:4], 1'b0};
+  wire _unused = &{ena, uio_in[7], 1'b0};
 
 endmodule
 

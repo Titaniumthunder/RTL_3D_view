@@ -27,8 +27,8 @@ module tb ();
   wire VGND = 1'b0;
 `endif
 
-  // The Tiny-TPU top module:
-  tt_um_titaniumthunder_tiny_tpu user_project (
+  // The Tiny-TPU v2 top module:
+  tt_um_titaniumthunder_tiny_tpu8 user_project (
 
       // Include power ports for the Gate Level test:
 `ifdef GL_TEST

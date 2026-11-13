@@ -9,33 +9,31 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-Tiny-TPU is one processing element (PE) of a tiny neural-network accelerator, built by team MAC Attack
-(Alex Salamati, James Manikyan, Marco Flores) for a motor-vibration fault detector.
+Tiny-TPU v2 is one processing element of a neural-network accelerator by team MAC Attack (Alex Salamati,
+James Manikyan, Marco Flores), for a motor-vibration fault detector.
 
-The PE multiplies two signed 4-bit numbers (INT4, an activation `a` and a weight `w`) and adds the product to a
-signed 16-bit accumulator. A host microcontroller (the RP2040 on the Tiny Tapeout demo board) keeps the trained
-model, streams each neuron's activation/weight pairs to the chip, reads back the 16-bit sum, and finishes the
-neuron itself (scale, bias, ReLU).
+It multiplies signed 8-bit numbers (INT8) and adds the products into an exact 22-bit sum. A 32-byte **input
+buffer** holds one layer's inputs, so the host sends a layer's inputs once and then only **one weight byte per
+multiply-add**. The host (the RP2040 on the demo board) keeps the model, runs it layer by layer, and does each
+layer's bias, rescaling and ReLU between layers. Any model whose layers have at most 32 inputs can run without
+changing the chip; INT4 models work too.
 
-Commands: `CLEAR` (accumulator = 0), `MAC` (accumulator += a x w), `READ` (copy the accumulator to the output
-register), `NOP`. If a MAC would leave the 16-bit range, the OVF flag goes high and stays high until the next
-`CLEAR`, so an overflow is never silent.
+Commands: `CLEAR` (sum = 0, back to buffer entry 0), `LOAD_X` (store the next input), `MAC` (sum += next stored
+input x the weight on DATA), `READ` (copy the sum to the output register), `NOP`. A sum that leaves the 22-bit
+range sets the OVF status flag until the next `CLEAR`.
 
 ## How to test
 
-Pins: `a` on `ui_in[3:0]`, `w` on `ui_in[7:4]` (both two's complement), command on `uio_in[1:0]`
-(0 NOP, 1 CLEAR, 2 MAC, 3 READ), STROBE on `uio_in[2]`, byte select HI on `uio_in[3]`, ACK on `uio_out[4]`,
-OVF on `uio_out[5]`, result byte on `uo_out[7:0]`.
+Pins: DATA on `ui_in[7:0]`; CMD on `uio_in[2:0]` (0 NOP, 1 CLEAR, 2 LOAD_X, 3 MAC, 4 READ); STROBE/VALID on
+`uio_in[3]`; MODE on `uio_in[4]`; BSEL on `uio_in[6:5]`; ACK on `uio_out[7]`. `uo_out` shows sum bits 7:0
+(BSEL 0), 15:8 (BSEL 1), 21:16 sign-extended (BSEL 2), or the status byte {0, buffer position, OVF} (BSEL 3).
 
-Each command is a 4-phase handshake:
+MODE 0 (handshake, any host speed): set DATA and CMD, raise STROBE, wait for ACK = 1, lower STROBE, wait for
+ACK = 0. MODE 1 (streaming): every rising clock edge with VALID = 1 runs CMD on DATA, one command per clock;
+DATA, CMD and VALID must be synchronous to the clock.
 
-1. Set `a`, `w` and the command.
-2. Raise STROBE.
-3. Wait for ACK = 1 (the command has run).
-4. Lower STROBE and wait for ACK = 0.
-
-To compute a dot product: `CLEAR`, one `MAC` per (a, w) pair, `READ`, then read `uo_out` with HI = 0 (bits 7:0)
-and HI = 1 (bits 15:8). Example: MAC(3, 2), MAC(-2, 4), MAC(1, -1) gives 6 - 8 - 1 = -3, read as 0xFFFD.
+One neuron with inputs 3, -2, 1 and weights 2, 4, -1: `CLEAR`, `LOAD_X 3`, `LOAD_X -2`, `LOAD_X 1`, `CLEAR`,
+`MAC 2`, `MAC 4`, `MAC -1`, `READ`, then the three sum bytes give 6 - 8 - 1 = -3.
 
 ## External hardware
 
