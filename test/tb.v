@@ -22,17 +22,13 @@ module tb ();
   wire [7:0] uo_out;
   wire [7:0] uio_out;
   wire [7:0] uio_oe;
-
-  // Named copies of the pins the test uses (UART from the chip, busy flag):
-  wire uart_tx = uo_out[0];
-  wire busy    = uo_out[1];
 `ifdef GL_TEST
   wire VPWR = 1'b1;
   wire VGND = 1'b0;
 `endif
 
-  // The MAC Attack mini top module:
-  tt_um_titaniumthunder_mac_attack user_project (
+  // The Tiny-TPU top module:
+  tt_um_titaniumthunder_tiny_tpu user_project (
 
       // Include power ports for the Gate Level test:
 `ifdef GL_TEST

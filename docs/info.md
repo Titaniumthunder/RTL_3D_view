@@ -9,41 +9,34 @@ You can also include images in this folder and reference them in the markdown. E
 
 ## How it works
 
-MAC Attack mini is a small matrix-multiply accelerator: a scaled-down version of our capstone "mini-TPU"
-(team MAC Attack: Alex Salamati, James Manikyan, Marco Flores). It computes C = A x B on signed 8-bit (INT8)
-numbers, exactly.
+Tiny-TPU is one processing element (PE) of a tiny neural-network accelerator, built by team MAC Attack
+(Alex Salamati, James Manikyan, Marco Flores) for a motor-vibration fault detector.
 
-- **2x2 weight-stationary systolic array** (4 processing elements). Each element multiplies two INT8 numbers
-  and adds the product to a running sum, every clock. A 2x2 block of B (the weights) is loaded into the array
-  and stays there; the rows of A flow across it and the partial sums flow down.
-- **Folding:** matrices up to 4x4 are stored on chip. A bigger multiply than 2x2 is done in passes, one 2x2
-  block of B per pass, and the passes add up in the C buffer. A 4x4 x 4x4 multiply takes 4 passes.
-  Clocks per job: passes x (M + 3P - 2), with passes = ceil(K/P) x ceil(N/P) and P = 2.
-- **Exact 18-bit sums:** the largest product is 128 x 128 = 16384, and 4 of them need 18 signed bits, so a
-  result can never overflow.
-- **UART interface** at 115,200 baud (8N1) from the 50 MHz clock.
+The PE multiplies two signed 4-bit numbers (INT4, an activation `a` and a weight `w`) and adds the product to a
+signed 16-bit accumulator. A host microcontroller (the RP2040 on the Tiny Tapeout demo board) keeps the trained
+model, streams each neuron's activation/weight pairs to the chip, reads back the 16-bit sum, and finishes the
+neuron itself (scale, bias, ReLU).
 
-The same RTL runs on our FPGA prototype as an 8x8 array with matrices up to 64x64; only the size parameters
-differ here.
+Commands: `CLEAR` (accumulator = 0), `MAC` (accumulator += a x w), `READ` (copy the accumulator to the output
+register), `NOP`. If a MAC would leave the 16-bit range, the OVF flag goes high and stays high until the next
+`CLEAR`, so an overflow is never silent.
 
 ## How to test
 
-Connect a UART (115,200 baud, 8 data bits, no parity, 1 stop bit) to the chip: your TX to `ui_in[0]`, your RX
-to `uo_out[0]`. Keep `ui_in[0]` high when idle. Commands (all numbers are bytes; results are 4 bytes,
-least significant byte first):
+Pins: `a` on `ui_in[3:0]`, `w` on `ui_in[7:4]` (both two's complement), command on `uio_in[1:0]`
+(0 NOP, 1 CLEAR, 2 MAC, 3 READ), STROBE on `uio_in[2]`, byte select HI on `uio_in[3]`, ACK on `uio_out[4]`,
+OVF on `uio_out[5]`, result byte on `uo_out[7:0]`.
 
-| Send | Reply | Meaning |
-|---|---|---|
-| `I` | `M` `A` `C` 2 8 18 4 | identify: P, input bits, sum bits, largest matrix |
-| `D` m k n | `k` (or `e` if a size is 0 or more than 4) | sizes: A is m x k, B is k x n |
-| `A` + m*k bytes | `k` | load A, row by row (two's complement) |
-| `B` + k*n bytes | `k` | load B, row by row |
-| `G` | `g` + passes + cycles + total | run; the counters are 4 bytes each |
-| `C` | m*n results, 4 bytes each | read C, row by row |
+Each command is a 4-phase handshake:
 
-Example: `D 4 4 4`, then `A` and 16 bytes, `B` and 16 bytes, `G` (reply: 4 passes, 32 cycles), then `C`
-returns the 16 sums. `uo_out[1]` is high while the array is computing.
+1. Set `a`, `w` and the command.
+2. Raise STROBE.
+3. Wait for ACK = 1 (the command has run).
+4. Lower STROBE and wait for ACK = 0.
+
+To compute a dot product: `CLEAR`, one `MAC` per (a, w) pair, `READ`, then read `uo_out` with HI = 0 (bits 7:0)
+and HI = 1 (bits 15:8). Example: MAC(3, 2), MAC(-2, 4), MAC(1, -1) gives 6 - 8 - 1 = -3, read as 0xFFFD.
 
 ## External hardware
 
-A USB-UART adapter (3.3 V), or the UART of the Tiny Tapeout demo board's microcontroller.
+None beyond the Tiny Tapeout demo board: its RP2040 acts as the host.
